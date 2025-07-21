@@ -1,0 +1,82 @@
+import json, os, boto3, uuid as uuidlib, time
+from botocore.exceptions import ClientError
+
+ecs   = boto3.client('ecs')
+ddb   = boto3.resource('dynamodb')
+table = ddb.Table(os.environ['SESSIONS_TABLE'])
+
+CLUSTER      = os.environ['ECS_CLUSTER']
+TASK_DEF     = os.environ['TASK_DEFINITION']
+SUBNETS      = os.environ['SUBNETS'].split(',')
+SECURITY_GRP = os.environ['SECURITY_GROUP']
+CONTAINER    = os.environ['CONTAINER_NAME']
+TTL_SECONDS  = 240
+
+# ---------- helpers ----------
+def extract_uuid_from_cookie(event):
+    cookie = (event.get('headers') or {}).get('cookie') or ''
+    for c in cookie.split(';'):
+        if c.strip().startswith('uuid='):
+            return c.strip()[5:]
+    return None
+
+def is_container_running(task_arn):
+    try:
+        resp = ecs.describe_tasks(cluster=CLUSTER, tasks=[task_arn])
+        return resp['tasks'][0]['lastStatus'] in {'PROVISIONING','PENDING','RUNNING'}
+    except Exception:
+        return False
+
+def start_fargate_container(uid):
+    resp = ecs.run_task(
+        cluster=CLUSTER,
+        taskDefinition=TASK_DEF,
+        launchType='FARGATE',
+        networkConfiguration={'awsvpcConfiguration':{
+            'subnets': SUBNETS, 'securityGroups':[SECURITY_GRP], 'assignPublicIp':'ENABLED'
+        }},
+        overrides={'containerOverrides':[{'name':CONTAINER,'environment':[{'name':'UUID','value':uid}]}]}
+    )
+    task_arn = resp['tasks'][0]['taskArn']
+    ec2 = boto3.client('ec2')
+    for _ in range(30):
+        desc = ecs.describe_tasks(cluster=CLUSTER, tasks=[task_arn])
+        for a in desc['tasks'][0].get('attachments',[]):
+            for d in a.get('details',[]):
+                if d['name']=='networkInterfaceId':
+                    eni=d['value']
+                    ip_resp=ec2.describe_network_interfaces(NetworkInterfaceIds=[eni])
+                    return {'taskArn':task_arn,'publicIp':ip_resp['NetworkInterfaces'][0]['Association']['PublicIp']}
+        time.sleep(3)
+    raise RuntimeError('No public IP assigned')
+
+# ---------- handler ----------
+def lambda_handler(event, context):
+    path = event.get('requestContext', {}).get('http', {}).get('path', '')
+
+    if path == '/':
+        with open('index.html', 'r', encoding='utf-8') as f:
+            html = f.read()
+        return {'statusCode': 200, 'headers': {'Content-Type': 'text/html'}, 'body': html}
+
+    uid = extract_uuid_from_cookie(event) or str(uuidlib.uuid4())
+    session = table.get_item(Key={'uuid': uid}).get('Item')
+    if session and is_container_running(session['taskArn']):
+        return {
+            'statusCode': 200,
+            'headers': {'Set-Cookie': f'uuid={uid}; Path=/; HttpOnly'},
+            'body': json.dumps({'publicIp': session['publicIp']})
+        }
+
+    task_info = start_fargate_container(uid)
+    table.put_item(Item={
+        'uuid': uid,
+        'taskArn': task_info['taskArn'],
+        'publicIp': task_info['publicIp'],
+        'ttl': int(time.time()) + TTL_SECONDS
+    })
+    return {
+        'statusCode': 201,
+        'headers': {'Set-Cookie': f'uuid={uid}; Path=/; HttpOnly'},
+        'body': json.dumps({'publicIp': task_info['publicIp']})
+    }
