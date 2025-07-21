@@ -1,0 +1,24 @@
+
+import os, time, boto3
+from datetime import datetime, timezone
+
+ecs = boto3.client('ecs')
+ddb = boto3.resource('dynamodb')
+TABLE = ddb.Table('UserContainer')
+CLUSTER = os.environ['CLUSTER']
+
+def lambda_handler(event, context):
+    now = int(time.time())
+    items = TABLE.scan(
+        FilterExpression='#s = :running',
+        ExpressionAttributeNames={'#s': 'status'},
+        ExpressionAttributeValues={':running': 'running'}
+    )['Items']
+
+    for item in items:
+        if item['expires'] < now:
+            try:
+                ecs.stop_task(cluster=CLUSTER, task=item['taskArn'], reason='idle')
+            except ecs.exceptions.InvalidParameterException:
+                pass  # already stopped
+            TABLE.delete_item(Key={'uuid': item['uuid']})
