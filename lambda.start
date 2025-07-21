@@ -1,0 +1,111 @@
+import json, os, time, boto3, uuid as uuidlib
+from datetime import datetime, timezone
+
+ecs   = boto3.client('ecs')
+ec2   = boto3.client('ec2')
+ddb   = boto3.resource('dynamodb')
+
+CLUSTER         = os.environ['CLUSTER']
+TASK_DEF        = os.environ['TASK_DEF']
+SUBNETS         = os.environ['SUBNETS'].split(',')   # comma-sep
+SECURITY_GROUPS = os.environ['SECURITY_GROUPS'].split(',')
+TABLE           = ddb.Table('UserContainer')
+
+TTL_SEC = 120   # seconds of silence before container can be killed
+
+def get_or_create_uuid(headers):
+    # cookie header is lower-cased by APIGW
+    cookie = headers.get('cookie') or ''
+    for kv in cookie.split(';'):
+        kv = kv.strip()
+        if kv.startswith('uuid='):
+            return kv[5:]
+    new_uuid = str(uuidlib.uuid4())
+    return new_uuid
+
+def get_public_ip(task_arn):
+    # wait up to 15 s for ENI attachment
+    for _ in range(15):
+        tasks = ecs.describe_tasks(cluster=CLUSTER, tasks=[task_arn])['tasks']
+        if tasks[0]['lastStatus'] == 'RUNNING':
+            eni = tasks[0]['attachments'][0]['details']
+            eni_id = next(d['value'] for d in eni if d['name'] == 'networkInterfaceId')
+            ip = ec2.describe_network_interfaces(NetworkInterfaceIds=[eni_id]) \
+                     ['NetworkInterfaces'][0]['Association']['PublicIp']
+            return ip
+        time.sleep(1)
+    raise RuntimeError('Task did not start in time')
+
+def lambda_handler(event, context):
+    headers = {k.lower(): v for k, v in event.get('headers', {}).items()}
+    method  = event['requestContext']['http']['method']
+    path    = event['requestContext']['http']['path']
+
+    # 1. Heartbeat route (POST /heartbeat)
+    if method == 'POST' and path == '/heartbeat':
+        uuid = get_or_create_uuid(headers)
+        try:
+            TABLE.update_item(
+                Key={'uuid': uuid},
+                UpdateExpression='SET expires = :e',
+                ExpressionAttributeValues={':e': int(time.time()) + TTL_SEC}
+            )
+        except:
+            pass  # If record doesn't exist, it's ok
+        return {
+            'statusCode': 200,
+            'headers': {'content-type': 'application/json'},
+            'body': json.dumps({'status': 'ok'})
+        }
+
+    # 2. Any other route (GET /, GET /xyz, etc.)
+    uuid = get_or_create_uuid(headers)
+    now_epoch = int(time.time())
+
+    try:
+        item = TABLE.get_item(Key={'uuid': uuid}).get('Item')
+    except:
+        item = None
+        
+    if item and item.get('status') == 'running':
+        # update TTL but keep the record
+        TABLE.update_item(
+            Key={'uuid': uuid},
+            UpdateExpression='SET expires = :e',
+            ExpressionAttributeValues={':e': now_epoch + TTL_SEC}
+        )
+        ip = item['publicIP']
+    else:
+        # start new task
+        task = ecs.run_task(
+            cluster=CLUSTER,
+            taskDefinition=TASK_DEF,
+            launchType='FARGATE',
+            networkConfiguration={
+                'awsvpcConfiguration': {
+                    'subnets': SUBNETS,
+                    'securityGroups': SECURITY_GROUPS,
+                    'assignPublicIp': 'ENABLED'
+                }
+            }
+        )['tasks'][0]
+        task_arn = task['taskArn']
+        ip = get_public_ip(task_arn)
+        
+        # Save session data permanently (never delete)
+        TABLE.put_item(Item={
+            'uuid': uuid,
+            'taskArn': task_arn,
+            'publicIP': ip,
+            'expires': now_epoch + TTL_SEC,
+            'status': 'running',
+            'createdAt': now_epoch,  # Track creation time
+            'totalContainers': item.get('totalContainers', 0) + 1 if item else 1
+        })
+
+    # redirect browser to the container
+    resp_headers = {
+        'location': f'http://{ip}{path}',
+        'set-cookie': f'uuid={uuid}; Path=/; SameSite=Lax; Max-Age=86400'  # 24hr cookie
+    }
+    return {'statusCode': 302, 'headers': resp_headers, 'body': ''}
