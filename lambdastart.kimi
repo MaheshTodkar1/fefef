@@ -1,0 +1,113 @@
+import json, os, time, boto3
+import uuid as uuidlib
+from datetime import datetime, timezone
+
+ecs = boto3.client('ecs')
+ec2 = boto3.client('ec2')
+ddb = boto3.resource('dynamodb')
+
+CLUSTER         = os.environ['CLUSTER']
+TASK_DEF        = os.environ['TASK_DEF']
+SUBNETS         = os.environ['SUBNETS'].split(',')
+SECURITY_GROUPS = os.environ['SECURITY_GROUPS'].split(',')
+TABLE           = ddb.Table(os.environ['TABLE'])
+TTL_SEC         = 120   # 2 min idle before cleanup
+
+# ------------------------------------------------------------------
+def get_or_create_uuid(headers):
+    cookie = headers.get('cookie') or ''
+    for kv in cookie.split(';'):
+        kv = kv.strip()
+        if kv.startswith('uuid='):
+            return kv[5:]
+    return str(uuidlib.uuid4())
+
+def get_public_ip(task_arn):
+    """Return the public IPv4 address of the running task."""
+    for _ in range(30):                   # wait up to 30 s
+        tasks = ecs.describe_tasks(cluster=CLUSTER, tasks=[task_arn])['tasks']
+        task  = tasks[0]
+        if task['lastStatus'] != 'RUNNING':
+            time.sleep(1)
+            continue
+
+        # find ENI id
+        eni_details = task['attachments'][0]['details']
+        eni_id = next(d['value'] for d in eni_details
+                      if d['name'] == 'networkInterfaceId')
+
+        # fetch public IP
+        interfaces = ec2.describe_network_interfaces(
+            NetworkInterfaceIds=[eni_id])['NetworkInterfaces']
+        public_ip = interfaces[0]['Association']['PublicIp']
+        return public_ip
+
+    raise RuntimeError('Task did not start in time')
+
+# ------------------------------------------------------------------
+def lambda_handler(event, context):
+    # Normalize headers / method / path
+    headers = {k.lower(): v for k, v in event.get('headers', {}).items()}
+    method  = event['requestContext']['http']['method']
+    path    = event['requestContext']['http']['path']
+
+    uuid = get_or_create_uuid(headers)
+    now  = int(time.time())
+
+    # ---------- Heartbeat ----------
+    if method == 'POST' and path == '/heartbeat':
+        TABLE.update_item(
+            Key={'uuid': uuid},
+            UpdateExpression='SET expires = :e',
+            ExpressionAttributeValues={':e': now + TTL_SEC}
+        )
+        return {
+            'statusCode': 200,
+            'headers': {'content-type': 'application/json'},
+            'body': json.dumps({'status': 'ok'})
+        }
+
+    # ---------- Normal page / catch-all ----------
+    item = TABLE.get_item(Key={'uuid': uuid}).get('Item')
+    if item and item['status'] == 'running':
+        # refresh TTL
+        TABLE.update_item(
+            Key={'uuid': uuid},
+            UpdateExpression='SET expires = :e',
+            ExpressionAttributeValues={':e': now + TTL_SEC}
+        )
+        public_ip = item['publicIP']
+    else:
+        # launch new Fargate task
+        task = ecs.run_task(
+            cluster=CLUSTER,
+            taskDefinition=TASK_DEF,
+            launchType='FARGATE',
+            networkConfiguration={
+                'awsvpcConfiguration': {
+                    'subnets': SUBNETS,
+                    'securityGroups': SECURITY_GROUPS,
+                    'assignPublicIp': 'ENABLED'
+                }
+            }
+        )['tasks'][0]
+        task_arn  = task['taskArn']
+        public_ip = get_public_ip(task_arn)
+
+        TABLE.put_item(Item={
+            'uuid': uuid,
+            'taskArn': task_arn,
+            'publicIP': public_ip,
+            'expires': now + TTL_SEC,
+            'status': 'running'
+        })
+
+    # 302 redirect to container with persistent cookie
+    return {
+        'statusCode': 302,
+        'headers': {
+            'location': f'http://{public_ip}{path}',
+            'set-cookie': f'uuid={uuid}; Path=/; SameSite=Lax; max-age=31536000'
+        },
+        'body': ''
+    }
