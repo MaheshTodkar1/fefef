@@ -1,0 +1,143 @@
+import json
+import os
+import time
+import uuid as uuidlib
+import base64
+import urllib3
+from datetime import datetime, timezone
+import boto3
+
+ecs   = boto3.client('ecs')
+ec2   = boto3.client('ec2')
+ddb   = boto3.resource('dynamodb')
+
+CLUSTER         = os.environ['CLUSTER']
+TASK_DEF        = os.environ['TASK_DEF']
+SUBNETS         = os.environ['SUBNETS'].split(',')
+SECURITY_GROUPS = os.environ['SECURITY_GROUPS'].split(',')
+TABLE           = ddb.Table('UserContainer')
+
+TTL_SEC = 120                # idle TTL
+http    = urllib3.PoolManager()   # urllib3 connection pool
+
+# ---------- helpers ----------
+def get_or_create_uuid(headers):
+    cookie = headers.get('cookie') or ''
+    for kv in cookie.split(';'):
+        kv = kv.strip()
+        if kv.startswith('uuid='):
+            return kv[5:]
+    return str(uuidlib.uuid4())
+
+def get_public_ip(task_arn: str) -> str:
+    for _ in range(15):
+        tasks = ecs.describe_tasks(cluster=CLUSTER, tasks=[task_arn])['tasks']
+        if tasks and tasks[0]['lastStatus'] == 'RUNNING':
+            eni_details = tasks[0]['attachments'][0]['details']
+            eni_id = next(d['value'] for d in eni_details if d['name'] == 'networkInterfaceId')
+            ip = ec2.describe_network_interfaces(
+                    NetworkInterfaceIds=[eni_id])['NetworkInterfaces'][0]['Association']['PublicIp']
+            return ip
+        time.sleep(1)
+    raise RuntimeError('Task did not start in time')
+
+# ---------- entry point ----------
+def lambda_handler(event, context):
+    headers = {k.lower(): v for k, v in event.get('headers', {}).items()}
+    method  = event['requestContext']['http']['method']
+    path    = event['requestContext']['http']['path']
+
+    # ---------- 1. heartbeat ----------
+    if method == 'POST' and path == '/heartbeat':
+        uuid = get_or_create_uuid(headers)
+        TABLE.update_item(
+            Key={'uuid': uuid},
+            UpdateExpression='SET expires = :e',
+            ExpressionAttributeValues={':e': int(time.time()) + TTL_SEC}
+        )
+        return {
+            'statusCode': 200,
+            'headers': {'content-type': 'application/json'},
+            'body': json.dumps({'status': 'ok'})
+        }
+
+    # ---------- 2. normal request ----------
+    uuid      = get_or_create_uuid(headers)
+    now_epoch = int(time.time())
+
+    item = TABLE.get_item(Key={'uuid': uuid}).get('Item')
+    if item and item.get('status') == 'running':
+        TABLE.update_item(
+            Key={'uuid': uuid},
+            UpdateExpression='SET expires = :e',
+            ExpressionAttributeValues={':e': now_epoch + TTL_SEC}
+        )
+        container_ip = item['publicIP']
+    else:
+        # start new container
+        task = ecs.run_task(
+            cluster=CLUSTER,
+            taskDefinition=TASK_DEF,
+            launchType='FARGATE',
+            networkConfiguration={
+                'awsvpcConfiguration': {
+                    'subnets': SUBNETS,
+                    'securityGroups': SECURITY_GROUPS,
+                    'assignPublicIp': 'ENABLED'
+                }
+            }
+        )['tasks'][0]
+        container_ip = get_public_ip(task['taskArn'])
+        TABLE.put_item(Item={
+            'uuid': uuid,
+            'taskArn': task['taskArn'],
+            'publicIP': container_ip,
+            'expires': now_epoch + TTL_SEC,
+            'status': 'running',
+            'createdAt': now_epoch
+        })
+
+    # ---------- 3. proxy the request ----------
+    url = f'http://{container_ip}{path}'
+    if event.get('rawQueryString'):
+        url += '?' + event['rawQueryString']
+
+    # forward headers (drop original Host, add container Host)
+    upstream_headers = {k: v for k, v in headers.items() if k != 'host'}
+    upstream_headers['host'] = container_ip
+
+    # body
+    body = event.get('body', '')
+    if event.get('isBase64Encoded', False):
+        body = base64.b64decode(body)
+
+    # actual upstream call
+    try:
+        resp = http.request(
+            method,
+            url,
+            headers=upstream_headers,
+            body=body,
+            timeout=urllib3.Timeout(connect=5, read=30)
+        )
+    except Exception as e:
+        return {
+            'statusCode': 502,
+            'headers': {'content-type': 'text/plain'},
+            'body': f'Bad Gateway: {e}'
+        }
+
+    # build response for browser
+    resp_headers = dict(resp.headers)
+    resp_headers.pop('content-encoding', None)
+    resp_headers.pop('transfer-encoding', None)
+
+    # set / refresh uuid cookie on the Lambda domain
+    resp_headers['set-cookie'] = f'uuid={uuid}; Path=/; SameSite=Lax; Max-Age=86400'
+
+    return {
+        'statusCode': resp.status,
+        'headers': resp_headers,
+        'body': base64.b64encode(resp.data).decode('utf-8'),
+        'isBase64Encoded': True
+    }
