@@ -1,0 +1,67 @@
+import os, time, boto3
+from datetime import datetime, timezone
+
+ecs = boto3.client('ecs')
+ddb = boto3.resource('dynamodb')
+TABLE = ddb.Table('UserContainer')
+CLUSTER = os.environ['CLUSTER']
+
+def lambda_handler(event, context):
+    now = int(time.time())
+    
+    try:
+        items = TABLE.scan(
+            FilterExpression='#s = :running',
+            ExpressionAttributeNames={'#s': 'status'},
+            ExpressionAttributeValues={':running': 'running'}
+        )['Items']
+
+        stopped_count = 0
+        for item in items:
+            if item['expires'] < now:
+                try:
+                    # Stop the ECS task
+                    ecs.stop_task(
+                        cluster=CLUSTER, 
+                        task=item['taskArn'], 
+                        reason='idle timeout - user inactive for 2+ minutes'
+                    )
+                    
+                    # Update status to stopped but KEEP the record
+                    TABLE.update_item(
+                        Key={'uuid': item['uuid']},
+                        UpdateExpression='SET #s = :stopped, stoppedAt = :stopped_time',
+                        ExpressionAttributeNames={'#s': 'status'},
+                        ExpressionAttributeValues={
+                            ':stopped': 'stopped',
+                            ':stopped_time': now
+                        }
+                    )
+                    stopped_count += 1
+                    
+                except ecs.exceptions.InvalidParameterException:
+                    # Task already stopped, just update status
+                    TABLE.update_item(
+                        Key={'uuid': item['uuid']},
+                        UpdateExpression='SET #s = :stopped, stoppedAt = :stopped_time',
+                        ExpressionAttributeNames={'#s': 'status'},
+                        ExpressionAttributeValues={
+                            ':stopped': 'stopped',
+                            ':stopped_time': now
+                        }
+                    )
+                except Exception as e:
+                    print(f"Error stopping task {item['taskArn']}: {e}")
+                    continue
+
+        return {
+            'statusCode': 200,
+            'body': f'Cleanup completed. Stopped {stopped_count} idle containers.'
+        }
+        
+    except Exception as e:
+        print(f"Cleanup error: {e}")
+        return {
+            'statusCode': 500,
+            'body': f'Cleanup failed: {str(e)}'
+        }
