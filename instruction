@@ -1,0 +1,36 @@
+The start Lambda spins up a short-lived container per browser, proxies all traffic to it, and keeps it alive as long as the tab sends a heartbeat.
+The cleanup Lambda runs every few minutes, scans the session table, and stops any container whose TTL has expired.
+Everything except the heartbeat keeps working even if the JS isn’t loaded; the container just dies sooner.”
+
+
+
+
+
+
+<script src="heartbeat.js"></script>
+
+
+// heartbeat.js
+setInterval(async () => {
+  try {
+    await fetch('/heartbeat', { method: 'POST', credentials: 'include' });
+  } catch {}
+}, 30_000);
+
+
+
+
+1. Lambda “start” (the one behind the HTTP endpoint)
+Every time a browser hits your root URL (/) it does the following:
+Looks for a cookie called uuid.
+If the cookie already exists and the DynamoDB table still lists that session as running, it simply forwards the request to the existing container’s public IP.
+If the cookie is missing or the associated task is gone, it starts a brand-new ECS (Fargate) task, waits until it has a public IP, stores the IP + task ARN in DynamoDB with a TTL, and then proxies the request to that new container.
+Before returning the response it sets/refresh the uuid cookie.
+If the browser later calls POST /heartbeat this Lambda will push the TTL further into the future (keeps the container alive as long as the tab is open).
+Every other path (e.g. /static/main.css) is proxied transparently to the running container.
+2. Lambda “cleanup” (triggered every few minutes via CloudWatch Events)
+Scans the DynamoDB table for rows whose status = running and whose expires < now.
+For each expired row it:
+Calls ecs.stop_task to actually shut the container down.
+Updates the row to status = stopped (so we keep the audit record but know it’s gone).
+Returns a small summary like “Stopped 3 idle containers”.
