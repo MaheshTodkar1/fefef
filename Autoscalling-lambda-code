@@ -1,0 +1,253 @@
+import json
+import os
+import time
+import base64
+import uuid as uuidlib
+import urllib3
+from datetime import datetime
+import boto3
+from http.cookies import SimpleCookie
+
+# AWS clients
+ecs = boto3.client('ecs')
+ec2 = boto3.client('ec2')
+ddb = boto3.resource('dynamodb')
+
+# Environment variables
+CLUSTER = os.environ['CLUSTER']
+SERVICE_NAME = os.environ['SERVICE_NAME']  # Your ECS service name
+CONTAINER_PORT = int(os.environ.get('CONTAINER_PORT', '80'))
+TABLE_NAME = os.environ.get('DYNAMODB_TABLE', 'session')
+
+# Initialize resources
+TABLE = ddb.Table(TABLE_NAME)
+http_pool = urllib3.PoolManager()
+
+def parse_uuid(headers):
+    """Extract or generate UUID from Cookie header"""
+    raw = headers.get('cookie', '')
+    cookies = SimpleCookie()
+    cookies.load(raw)
+    
+    if 'uuid' in cookies:
+        return cookies['uuid'].value
+    
+    # Generate new UUID for new user
+    new_uuid = str(uuidlib.uuid4())
+    return new_uuid
+
+def track_user_visit(uuid, method, path):
+    """Store user visit in DynamoDB"""
+    try:
+        now = int(time.time())
+        TABLE.put_item(Item={
+            'uuid': uuid,
+            'method': method,
+            'path': path,
+            'timestamp': now,
+            'visitedAt': datetime.fromtimestamp(now).isoformat(),
+            'status': 'active'
+        })
+        print(f"Tracked visit for user {uuid}: {method} {path}")
+    except Exception as e:
+        print(f"Error tracking user visit: {e}")
+
+def get_service_tasks():
+    """Get all running tasks from the ECS service"""
+    try:
+        # List tasks in the service
+        task_arns = ecs.list_tasks(
+            cluster=CLUSTER,
+            serviceName=SERVICE_NAME,
+            desiredStatus='RUNNING'
+        )['taskArns']
+        
+        if not task_arns:
+            return []
+        
+        # Get task details
+        tasks_response = ecs.describe_tasks(
+            cluster=CLUSTER,
+            tasks=task_arns
+        )
+        
+        running_tasks = []
+        for task in tasks_response['tasks']:
+            if task['lastStatus'] == 'RUNNING':
+                try:
+                    # Get ENI details from attachments
+                    details = task['attachments'][0]['details']
+                    eni_id = next(d['value'] for d in details if d['name'] == 'networkInterfaceId')
+                    
+                    # Get public IP from ENI
+                    iface = ec2.describe_network_interfaces(NetworkInterfaceIds=[eni_id])['NetworkInterfaces'][0]
+                    public_ip = iface.get('Association', {}).get('PublicIp')
+                    
+                    if public_ip:
+                        running_tasks.append({
+                            'taskArn': task['taskArn'],
+                            'publicIp': public_ip
+                        })
+                        print(f"Found running task with IP: {public_ip}")
+                except Exception as e:
+                    print(f"Error getting IP for task {task['taskArn']}: {e}")
+                    continue
+        
+        return running_tasks
+    except Exception as e:
+        print(f"Error getting service tasks: {e}")
+        return []
+
+def get_available_container():
+    """Get an available container IP from the service"""
+    import random
+    
+    tasks = get_service_tasks()
+    
+    if not tasks:
+        raise RuntimeError("No running tasks found in ECS service")
+    
+    # Random selection for basic load balancing across containers
+    # When ECS scales up, requests will be distributed randomly
+    selected_task = random.choice(tasks)
+    return selected_task['publicIp']
+
+def proxy_request(event, container_ip):
+    """Forward the API Gateway event to the container and return Lambda response"""
+    method = event['requestContext']['http']['method']
+    path = event['requestContext']['http']['path']
+    query = event.get('rawQueryString', '')
+    
+    # Build target URL
+    url = f'http://{container_ip}:{CONTAINER_PORT}{path}'
+    if query:
+        url += f'?{query}'
+    
+    print(f"Proxying {method} {url}")
+    
+    # Build headers, replace host header
+    headers = {k: v for k, v in event.get('headers', {}).items()}
+    headers['host'] = f'{container_ip}:{CONTAINER_PORT}'
+    
+    # Handle request body
+    body = event.get('body', '')
+    if event.get('isBase64Encoded', False):
+        body = base64.b64decode(body)
+    
+    # Send request to container
+    try:
+        resp = http_pool.request(
+            method, url,
+            headers=headers,
+            body=body,
+            timeout=urllib3.Timeout(connect=10, read=30)
+        )
+    except Exception as e:
+        print(f"Error proxying request: {e}")
+        return {
+            'statusCode': 502,
+            'headers': {'content-type': 'text/plain'},
+            'body': f'Bad Gateway: Failed to connect to container - {str(e)}'
+        }
+    
+    # Build response headers
+    response_headers = dict(resp.headers)
+    
+    # Remove hop-by-hop headers that shouldn't be forwarded
+    for h in ['content-encoding', 'transfer-encoding', 'connection']:
+        response_headers.pop(h, None)
+    
+    # Determine if response should be base64 encoded
+    content_type = response_headers.get('content-type', '').lower()
+    is_binary = not (
+        content_type.startswith('text/') or
+        content_type.startswith('application/json') or
+        content_type.startswith('application/xml') or
+        'charset' in content_type
+    )
+    
+    if is_binary:
+        # Binary content - base64 encode
+        return {
+            'statusCode': resp.status,
+            'headers': response_headers,
+            'body': base64.b64encode(resp.data).decode('utf-8'),
+            'isBase64Encoded': True
+        }
+    else:
+        # Text content - return as string
+        try:
+            body_text = resp.data.decode('utf-8')
+            return {
+                'statusCode': resp.status,
+                'headers': response_headers,
+                'body': body_text,
+                'isBase64Encoded': False
+            }
+        except UnicodeDecodeError:
+            # Fallback to base64 if decode fails
+            return {
+                'statusCode': resp.status,
+                'headers': response_headers,
+                'body': base64.b64encode(resp.data).decode('utf-8'),
+                'isBase64Encoded': True
+            }
+
+def lambda_handler(event, context):
+    """Main Lambda handler for ECS service routing"""
+    try:
+        # Extract request details
+        headers = {k.lower(): v for k, v in event.get('headers', {}).items()}
+        method = event['requestContext']['http']['method']
+        path = event['requestContext']['http']['path']
+        
+        print(f"Processing {method} {path}")
+        
+        # Get or generate user UUID
+        uuid = parse_uuid(headers)
+        print(f"User UUID: {uuid}")
+        
+        # Track user visit in DynamoDB
+        track_user_visit(uuid, method, path)
+        
+        # Get available container from ECS service
+        try:
+            container_ip = get_available_container()
+            print(f"Selected container IP: {container_ip}")
+        except RuntimeError as e:
+            print(f"No containers available: {e}")
+            return {
+                'statusCode': 503,
+                'headers': {
+                    'content-type': 'text/html',
+                    'set-cookie': f'uuid={uuid}; Path=/; SameSite=Lax; Max-Age=86400'
+                },
+                'body': '''
+                <html><body>
+                <h1>Service Temporarily Unavailable</h1>
+                <p>No containers are currently running. The service is scaling up.</p>
+                <p>Please refresh in a few seconds.</p>
+                </body></html>
+                '''
+            }
+        
+        # Proxy request to container
+        response = proxy_request(event, container_ip)
+        
+        # Always set UUID cookie in response
+        response['headers']['set-cookie'] = f'uuid={uuid}; Path=/; SameSite=Lax; Max-Age=86400'
+        
+        # Add CORS headers if needed
+        if 'access-control-allow-origin' not in response['headers']:
+            response['headers']['Access-Control-Allow-Origin'] = '*'
+            response['headers']['Access-Control-Allow-Credentials'] = 'true'
+        
+        return response
+        
+    except Exception as e:
+        print(f"Lambda handler error: {str(e)}")
+        return {
+            'statusCode': 500,
+            'headers': {'content-type': 'text/plain'},
+            'body': f'Internal Server Error: {str(e)}'
+        }
