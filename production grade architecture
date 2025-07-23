@@ -1,0 +1,320 @@
+# Production-Grade Secure Architecture Options
+
+## Current Issue
+- **Problem**: Containers in public subnets with public IPs are directly exposed to the internet
+- **Security Risks**: Direct access, DDoS attacks, port scanning, unauthorized access
+- **Lambda Issue**: Lambda needs to reach containers somehow for proxying
+
+## Solution 1: Application Load Balancer (ALB) Pattern ⭐ **RECOMMENDED**
+
+### Architecture:
+```
+Internet → API Gateway → Lambda → ALB (Public) → ECS Tasks (Private)
+```
+
+### Benefits:
+- ✅ Containers in private subnets (no public IPs)
+- ✅ Single public entry point (ALB)
+- ✅ SSL termination, WAF protection
+- ✅ Health checks and auto-scaling
+- ✅ Session affinity (sticky sessions)
+
+### Implementation:
+```python
+# Modified Lambda code
+def proxy_request(event, alb_dns_name, target_group_arn):
+    """Forward request to ALB instead of direct container IP"""
+    method = event['requestContext']['http']['method']
+    path = event['requestContext']['http']['path']
+    query = event.get('rawQueryString', '')
+    
+    # Use ALB DNS name instead of container IP
+    url = f'https://{alb_dns_name}{path}' + (f'?{query}' if query else '')
+    
+    # Add session routing header for sticky sessions
+    headers = {k: v for k, v in event.get('headers', {}).items()}
+    headers['X-Session-ID'] = uuid  # For session affinity
+    
+    # Rest of proxy logic...
+```
+
+### Infrastructure Changes:
+- **VPC**: Public + Private subnets
+- **ALB**: In public subnets
+- **ECS Tasks**: In private subnets
+- **Target Group**: Dynamic registration of tasks
+- **Security Groups**: Restrict ALB → ECS communication
+
+---
+
+## Solution 2: NAT Gateway + Private Load Balancer
+
+### Architecture:
+```
+Internet → API Gateway → Lambda (Public) → Internal ALB (Private) → ECS Tasks (Private)
+```
+
+### Benefits:
+- ✅ Everything private except Lambda
+- ✅ Lambda can reach private ALB via VPC endpoints
+- ✅ Containers can reach internet via NAT Gateway
+
+### Lambda VPC Configuration:
+```python
+# Lambda needs VPC configuration to access private resources
+# Environment variables:
+INTERNAL_ALB_DNS = os.environ['INTERNAL_ALB_DNS']  # internal-alb.internal
+
+def proxy_request(event, internal_alb_dns):
+    url = f'http://{internal_alb_dns}{path}'  # Internal ALB
+    # Rest of logic...
+```
+
+---
+
+## Solution 3: API Gateway Direct Integration
+
+### Architecture:
+```
+Internet → API Gateway → VPC Link → ALB (Private) → ECS Tasks (Private)
+```
+
+### Benefits:
+- ✅ No Lambda needed for proxying
+- ✅ Direct API Gateway to private ALB
+- ✅ Lower latency, higher throughput
+- ✅ Built-in caching, throttling
+
+### Limitations:
+- ❌ Less control over session management
+- ❌ Harder to implement custom logic
+- ❌ Container lifecycle management becomes complex
+
+---
+
+## Solution 4: Service Mesh with AWS App Mesh
+
+### Architecture:
+```
+Internet → API Gateway → Lambda → Envoy Proxy → ECS Tasks (Private)
+```
+
+### Benefits:
+- ✅ Fine-grained traffic control
+- ✅ Observability and monitoring
+- ✅ Circuit breakers, retries
+- ✅ mTLS between services
+
+---
+
+## **RECOMMENDED IMPLEMENTATION: ALB Pattern**
+
+### Step-by-Step Implementation:
+
+#### 1. **VPC Setup**
+```terraform
+# Public subnets for ALB
+resource "aws_subnet" "public" {
+  count                   = 2
+  cidr_block              = "10.0.${count.index + 1}.0/24"
+  availability_zone       = data.aws_availability_zones.available.names[count.index]
+  map_public_ip_on_launch = true
+}
+
+# Private subnets for ECS tasks
+resource "aws_subnet" "private" {
+  count      = 2
+  cidr_block = "10.0.${count.index + 10}.0/24"
+  availability_zone = data.aws_availability_zones.available.names[count.index]
+}
+
+# NAT Gateway for private subnet internet access (if needed)
+resource "aws_nat_gateway" "main" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public[0].id
+}
+```
+
+#### 2. **Application Load Balancer**
+```terraform
+resource "aws_lb" "main" {
+  name               = "container-alb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb.id]
+  subnets           = aws_subnet.public[*].id
+}
+
+resource "aws_lb_target_group" "containers" {
+  name        = "container-targets"
+  port        = 80
+  protocol    = "HTTP"
+  vpc_id      = aws_vpc.main.id
+  target_type = "ip"
+  
+  health_check {
+    enabled             = true
+    healthy_threshold   = 2
+    interval           = 30
+    matcher            = "200"
+    path               = "/health"
+    port               = "traffic-port"
+    protocol           = "HTTP"
+    timeout            = 5
+    unhealthy_threshold = 2
+  }
+}
+```
+
+#### 3. **Modified ECS Task Definition**
+```json
+{
+  "family": "secure-container",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::account:role/ecsTaskExecutionRole",
+  "containerDefinitions": [{
+    "name": "app",
+    "image": "your-app:latest",
+    "portMappings": [{
+      "containerPort": 80,
+      "protocol": "tcp"
+    }],
+    "logConfiguration": {
+      "logDriver": "awslogs",
+      "options": {
+        "awslogs-group": "/ecs/secure-container",
+        "awslogs-region": "us-east-1",
+        "awslogs-stream-prefix": "ecs"
+      }
+    }
+  }]
+}
+```
+
+#### 4. **Security Groups**
+```terraform
+# ALB Security Group
+resource "aws_security_group" "alb" {
+  name_prefix = "alb-sg"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [aws_security_group.ecs_tasks.id]
+  }
+}
+
+# ECS Tasks Security Group
+resource "aws_security_group" "ecs_tasks" {
+  name_prefix = "ecs-tasks-sg"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+```
+
+#### 5. **Updated Lambda Code**
+```python
+def handle_container_request(event):
+    # ... existing session logic ...
+    
+    if not item or item.get('status') != 'running':
+        # Spawn new task in private subnet
+        task = ecs.run_task(
+            cluster=CLUSTER,
+            taskDefinition=TASK_DEF,
+            launchType='FARGATE',
+            networkConfiguration={
+                'awsvpcConfiguration': {
+                    'subnets': PRIVATE_SUBNETS,  # Private subnets
+                    'securityGroups': [ECS_SECURITY_GROUP],
+                    'assignPublicIp': 'DISABLED'  # No public IP
+                }
+            }
+        )['tasks'][0]
+        
+        # Register task with ALB target group
+        task_ip = get_task_private_ip(task['taskArn'])
+        elbv2.register_targets(
+            TargetGroupArn=TARGET_GROUP_ARN,
+            Targets=[{
+                'Id': task_ip,
+                'Port': 80
+            }]
+        )
+        
+        # Store ALB DNS instead of task IP
+        TABLE.put_item(Item={
+            'uuid': uuid,
+            'taskArn': task['taskArn'],
+            'albDns': ALB_DNS_NAME,  # Use ALB DNS
+            'taskIp': task_ip,
+            'expires': now + TTL_SEC,
+            'status': 'running',
+            'createdAt': now
+        })
+    
+    # Proxy to ALB instead of direct container
+    return proxy_request(event, ALB_DNS_NAME, uuid)
+```
+
+### Additional Security Enhancements:
+
+1. **WAF (Web Application Firewall)**
+   - Rate limiting
+   - IP whitelisting/blacklisting
+   - SQL injection protection
+
+2. **VPC Flow Logs**
+   - Monitor network traffic
+   - Detect suspicious activity
+
+3. **CloudTrail**
+   - API call logging
+   - Compliance and auditing
+
+4. **Secrets Manager**
+   - Store database credentials
+   - API keys and certificates
+
+5. **Parameter Store**
+   - Configuration management
+   - Environment variables
+
+### Cost Considerations:
+- **ALB**: ~$16/month + data processing
+- **NAT Gateway**: ~$32/month + data transfer
+- **VPC Endpoints**: ~$7/month per endpoint
+
+The ALB pattern provides the best balance of security, scalability, and maintainability for production workloads.
