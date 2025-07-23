@@ -1,0 +1,262 @@
+import json
+import os
+import time
+import base64
+import uuid as uuidlib
+import urllib3
+from datetime import datetime
+import boto3
+from http.cookies import SimpleCookie
+
+# AWS clients
+ecs = boto3.client('ecs')
+ec2 = boto3.client('ec2')
+ddb = boto3.resource('dynamodb')
+
+# Environment variables
+CLUSTER         = os.environ['CLUSTER']
+TASK_DEF        = os.environ['TASK_DEF']
+SUBNETS         = os.environ['SUBNETS'].split(',')
+SECURITY_GROUPS = os.environ['SECURITY_GROUPS'].split(',')
+TABLE_NAME      = os.environ.get('DYNAMODB_TABLE', 'session')
+TTL_SEC         = int(os.environ.get('TTL_SEC', '240'))  # idle TTL seconds
+
+# Initialize resources
+TABLE = ddb.Table(TABLE_NAME)
+http_pool = urllib3.PoolManager()
+
+
+def parse_uuid(headers):
+    """Extract or generate UUID from Cookie header"""
+    raw = headers.get('cookie', '')
+    cookies = SimpleCookie()
+    cookies.load(raw)
+    if 'uuid' in cookies:
+        return cookies['uuid'].value
+    new_uuid = str(uuidlib.uuid4())
+    return new_uuid
+
+
+def get_public_ip(task_arn):
+    """Wait for ECS task ENI and return its public IP"""
+    for _ in range(60):  # wait up to 60s
+        resp = ecs.describe_tasks(cluster=CLUSTER, tasks=[task_arn])
+        tasks = resp.get('tasks', [])
+        if not tasks:
+            time.sleep(1)
+            continue
+        task = tasks[0]
+        status = task.get('lastStatus')
+        if status == 'RUNNING':
+            details = task['attachments'][0]['details']
+            eni_id = next(d['value'] for d in details if d['name'] == 'networkInterfaceId')
+            iface = ec2.describe_network_interfaces(NetworkInterfaceIds=[eni_id])['NetworkInterfaces'][0]
+            return iface['Association']['PublicIp']
+        if status == 'STOPPED':
+            reason = task.get('stoppedReason', 'Unknown')
+            raise RuntimeError(f"Task stopped unexpectedly: {reason}")
+        time.sleep(1)
+    raise RuntimeError('Task did not start in time')
+
+
+def proxy_request(event, container_ip):
+    """Forward the API Gateway event to the container and return Lambda response"""
+    method = event['requestContext']['http']['method']
+    path = event['requestContext']['http']['path']
+    query = event.get('rawQueryString', '')
+    url = f'http://{container_ip}{path}' + (f'?{query}' if query else '')
+
+    # Build headers, replace host
+    headers = {k: v for k, v in event.get('headers', {}).items()}
+    headers['host'] = container_ip
+
+    # Body
+    body = event.get('body', '')
+    if event.get('isBase64Encoded', False):
+        body = base64.b64decode(body)
+
+    # Send request
+    try:
+        resp = http_pool.request(
+            method, url,
+            headers=headers,
+            body=body,
+            timeout=urllib3.Timeout(connect=5, read=30)
+        )
+    except Exception as e:
+        return {
+            'statusCode': 502,
+            'headers': {'content-type': 'text/plain'},
+            'body': f'Bad Gateway: {e}'
+        }
+
+    # Construct response
+    response_headers = dict(resp.headers)
+    # Remove these hop-by-hop headers
+    for h in ['content-encoding', 'transfer-encoding', 'connection']:
+        response_headers.pop(h, None)
+
+    return {
+        'statusCode': resp.status,
+        'headers': response_headers,
+        'body': base64.b64encode(resp.data).decode('utf-8'),
+        'isBase64Encoded': True
+    }
+
+
+def handle_cleanup():
+    """Handle cleanup of expired containers"""
+    now = int(time.time())
+    stopped_count = 0
+
+    # 1) Paginated scan for running sessions
+    scan_kwargs = {
+        'FilterExpression': '#s = :running',
+        'ExpressionAttributeNames': {'#s': 'status'},
+        'ExpressionAttributeValues': {':running': 'running'}
+    }
+    items = []
+    while True:
+        resp = TABLE.scan(**scan_kwargs)
+        items.extend(resp.get('Items', []))
+        if 'LastEvaluatedKey' not in resp:
+            break
+        scan_kwargs['ExclusiveStartKey'] = resp['LastEvaluatedKey']
+
+    print(f"Found {len(items)} running sessions; now={now}")
+
+    # 2) Stop and mark expired
+    for item in items:
+        uuid = item['uuid']
+        expires = item.get('expires', 0)
+        print(f"Checking uuid={uuid} expires={expires}")
+
+        if expires < now:
+            try:
+                ecs.stop_task(cluster=CLUSTER, task=item['taskArn'], reason='idle timeout')
+                print(f"Stopped ECS task: {item['taskArn']}")
+            except ecs.exceptions.InvalidParameterException:
+                print(f"Task already stopped: {item['taskArn']}")
+            except Exception as e:
+                print(f"Error stopping {item['taskArn']}: {e}")
+                continue
+
+            # Update status but keep record
+            TABLE.update_item(
+                Key={'uuid': uuid},
+                UpdateExpression='SET #s = :stopped, stoppedAt = :t',
+                ExpressionAttributeNames={'#s': 'status'},
+                ExpressionAttributeValues={':stopped': 'stopped', ':t': now}
+            )
+            stopped_count += 1
+
+    return {
+        'statusCode': 200,
+        'body': f'Cleanup completed. Stopped {stopped_count} idle containers.'
+    }
+
+
+def handle_container_request(event):
+    """Handle container creation and proxying"""
+    # Normalize
+    headers = {k.lower(): v for k, v in event.get('headers', {}).items()}
+    method  = event['requestContext']['http']['method']
+    path    = event['requestContext']['http']['path']
+
+    # Get or create UUID
+    uuid = parse_uuid(headers)
+
+    # Heartbeat endpoint
+    if method == 'POST' and path == '/heartbeat':
+        now = int(time.time())
+        TABLE.update_item(
+            Key={'uuid': uuid},
+            UpdateExpression='SET expires = :e',
+            ExpressionAttributeValues={':e': now + TTL_SEC}
+        )
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Credentials': True
+            },
+            'body': json.dumps({'status': 'ok'})
+        }
+
+    # Check existing session
+    resp = TABLE.get_item(Key={'uuid': uuid})
+    item = resp.get('Item')
+    # If found and running, refresh TTL
+    if item and item.get('status') == 'running':
+        now = int(time.time())
+        TABLE.update_item(
+            Key={'uuid': uuid},
+            UpdateExpression='SET expires = :e',
+            ExpressionAttributeValues={':e': now + TTL_SEC}
+        )
+        container_ip = item['publicIP']
+    else:
+        # Only spawn on the root path
+        if path != '/':
+            return {
+                'statusCode': 302,
+                'headers': {
+                    'location': '/',
+                    'set-cookie': f'uuid={uuid}; Path=/; SameSite=Lax; Max-Age=86400'
+                },
+                'body': ''
+            }
+        # Spawn new task
+        task = ecs.run_task(
+            cluster=CLUSTER,
+            taskDefinition=TASK_DEF,
+            launchType='FARGATE',
+            networkConfiguration={
+                'awsvpcConfiguration': {
+                    'subnets': SUBNETS,
+                    'securityGroups': SECURITY_GROUPS,
+                    'assignPublicIp': 'ENABLED'
+                }
+            }
+        )['tasks'][0]
+        container_ip = get_public_ip(task['taskArn'])
+        now = int(time.time())
+        TABLE.put_item(Item={
+            'uuid': uuid,
+            'taskArn': task['taskArn'],
+            'publicIP': container_ip,
+            'expires': now + TTL_SEC,
+            'status': 'running',
+            'createdAt': now
+        })
+
+    # Proxy all traffic to container
+    response = proxy_request(event, container_ip)
+    # Always set the UUID cookie
+    response['headers']['set-cookie'] = f'uuid={uuid}; Path=/; SameSite=Lax; Max-Age=86400'
+    return response
+
+
+def lambda_handler(event, context):
+    """Main Lambda handler that routes to appropriate function"""
+    
+    # Check if this is a cleanup event (EventBridge/CloudWatch scheduled event)
+    if event.get('source') == 'aws.events' or 'detail-type' in event:
+        print("Handling cleanup event")
+        return handle_cleanup()
+    
+    # Check if this is a manual cleanup trigger via path
+    if (event.get('requestContext', {}).get('http', {}).get('path') == '/cleanup' and 
+        event.get('requestContext', {}).get('http', {}).get('method') == 'POST'):
+        print("Handling manual cleanup request")
+        return handle_cleanup()
+    
+    # Check if this is an API Gateway event (has requestContext)
+    if 'requestContext' in event and 'http' in event['requestContext']:
+        print("Handling container request")
+        return handle_container_request(event)
+    
+    # Default case - assume it's a container request
+    print("Default handling as container request")
+    return handle_container_request(event)
