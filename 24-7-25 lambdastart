@@ -1,0 +1,333 @@
+import json
+import os
+import time
+import base64
+import uuid as uuidlib
+import urllib3
+from datetime import datetime
+import boto3
+from http.cookies import SimpleCookie
+
+# AWS clients
+ecs = boto3.client('ecs')
+ec2 = boto3.client('ec2')
+ddb = boto3.resource('dynamodb')
+
+# Environment variables
+CLUSTER = os.environ['CLUSTER']
+SERVICE_NAME = os.environ['SERVICE_NAME']
+CONTAINER_PORT = int(os.environ.get('CONTAINER_PORT', '80'))
+TABLE_NAME = os.environ.get('DYNAMODB_TABLE', 'session')
+SCALE_UP_TIMEOUT = int(os.environ.get('SCALE_UP_TIMEOUT', '180'))
+
+# Initialize resources
+TABLE = ddb.Table(TABLE_NAME)
+http_pool = urllib3.PoolManager()
+
+def parse_uuid(headers):
+    """Extract or generate UUID from Cookie header"""
+    raw = headers.get('cookie', '')
+    cookies = SimpleCookie()
+    cookies.load(raw)
+
+    if 'uuid' in cookies:
+        return cookies['uuid'].value
+
+    new_uuid = str(uuidlib.uuid4())
+    return new_uuid
+
+def update_last_request_time():
+    """Update the last request timestamp in DynamoDB for scale-down tracking"""
+    try:
+        now = int(time.time())
+        TABLE.put_item(Item={
+            'uuid': 'SYSTEM_LAST_REQUEST',
+            'lastRequestTime': now,
+            'expires': now + 86400  # 24 hours
+        })
+        print(f"Updated last request time: {now}")
+    except Exception as e:
+        print(f"Error updating last request time: {e}")
+
+def track_user_visit(uuid, method, path):
+    """Store/update user visit in DynamoDB"""
+    try:
+        now = int(time.time())
+
+        # Update system-wide last request time for scale-down logic
+        update_last_request_time()
+
+        # Check if user already exists
+        try:
+            response = TABLE.get_item(Key={'uuid': uuid})
+            if 'Item' in response:
+                TABLE.update_item(
+                    Key={'uuid': uuid},
+                    UpdateExpression='SET expires = :exp, #status = :status, lastPath = :path, lastMethod = :method',
+                    ExpressionAttributeNames={'#status': 'status'},
+                    ExpressionAttributeValues={
+                        ':exp': now + 7200,
+                        ':status': 'active',
+                        ':path': path,
+                        ':method': method
+                    }
+                )
+                print(f"Updated existing user {uuid}: {method} {path}")
+            else:
+                TABLE.put_item(Item={
+                    'uuid': uuid,
+                    'createdAt': now,
+                    'expires': now + 7200,
+                    'publicIp': 'service-managed',
+                    'status': 'active',
+                    'taskArn': 'service-managed',
+                    'lastPath': path,
+                    'lastMethod': method
+                })
+                print(f"Created new user record {uuid}: {method} {path}")
+        except Exception as e:
+            print(f"Error accessing DynamoDB: {e}")
+
+    except Exception as e:
+        print(f"Error tracking user visit: {e}")
+
+def get_service_tasks():
+    """Get all running tasks from the ECS service"""
+    try:
+        task_arns = ecs.list_tasks(
+            cluster=CLUSTER,
+            serviceName=SERVICE_NAME,
+            desiredStatus='RUNNING'
+        )['taskArns']
+
+        if not task_arns:
+            return []
+
+        tasks_response = ecs.describe_tasks(
+            cluster=CLUSTER,
+            tasks=task_arns
+        )
+
+        running_tasks = []
+        for task in tasks_response['tasks']:
+            if task['lastStatus'] == 'RUNNING':
+                try:
+                    details = task['attachments'][0]['details']
+                    eni_id = next(d['value'] for d in details if d['name'] == 'networkInterfaceId')
+
+                    iface = ec2.describe_network_interfaces(NetworkInterfaceIds=[eni_id])['NetworkInterfaces'][0]
+                    public_ip = iface.get('Association', {}).get('PublicIp')
+
+                    if public_ip:
+                        running_tasks.append({
+                            'taskArn': task['taskArn'],
+                            'publicIp': public_ip
+                        })
+                        print(f"Found running task with IP: {public_ip}")
+                except Exception as e:
+                    print(f"Error getting IP for task {task['taskArn']}: {e}")
+                    continue
+
+        return running_tasks
+    except Exception as e:
+        print(f"Error getting service tasks: {e}")
+        return []
+
+def scale_service_to_count(desired_count):
+    """Scale the ECS service to specified count"""
+    try:
+        print(f"Scaling service to {desired_count} tasks...")
+        ecs.update_service(
+            cluster=CLUSTER,
+            service=SERVICE_NAME,
+            desiredCount=desired_count
+        )
+        print(f"Service scale request sent successfully to {desired_count}")
+        return True
+    except Exception as e:
+        print(f"Error scaling service: {e}")
+        return False
+
+def wait_for_running_task():
+    """Wait for at least one task to be in RUNNING state"""
+    print("Waiting for task to start...")
+    start_time = time.time()
+    
+    while time.time() - start_time < SCALE_UP_TIMEOUT:
+        tasks = get_service_tasks()
+        if tasks:
+            print(f"Task is running! Found {len(tasks)} running tasks")
+            return tasks[0]['publicIp']
+        
+        print("Still waiting for task to start...")
+        time.sleep(5)
+    
+    raise TimeoutError(f"Task did not start within {SCALE_UP_TIMEOUT} seconds")
+
+def get_available_container():
+    """Get an available container IP from the service, scaling up if necessary"""
+    import random
+
+    # Check if any tasks are already running
+    tasks = get_service_tasks()
+    
+    if tasks:
+        selected_task = random.choice(tasks)
+        print(f"Using existing running task: {selected_task['publicIp']}")
+        return selected_task['publicIp']
+    
+    # No tasks running - need to scale up from 0
+    print("No running tasks found. Initiating scale from 0 to 1...")
+    
+    if not scale_service_to_count(1):
+        raise RuntimeError("Failed to initiate service scaling")
+    
+    # Wait for the task to start and return its IP
+    try:
+        container_ip = wait_for_running_task()
+        print(f"Successfully scaled up and got container IP: {container_ip}")
+        return container_ip
+    except TimeoutError as e:
+        raise RuntimeError(f"Scale-up failed: {str(e)}")
+
+def proxy_request(event, container_ip):
+    """Forward the API Gateway event to the container and return Lambda response"""
+    method = event['requestContext']['http']['method']
+    path = event['requestContext']['http']['path']
+    query = event.get('rawQueryString', '')
+
+    url = f'http://{container_ip}:{CONTAINER_PORT}{path}'
+    if query:
+        url += f'?{query}'
+
+    print(f"Proxying {method} {url}")
+
+    headers = {k: v for k, v in event.get('headers', {}).items()}
+    headers['host'] = f'{container_ip}:{CONTAINER_PORT}'
+
+    body = event.get('body', '')
+    if event.get('isBase64Encoded', False):
+        body = base64.b64decode(body)
+
+    # Send request to container with retries
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            resp = http_pool.request(
+                method, url,
+                headers=headers,
+                body=body,
+                timeout=urllib3.Timeout(connect=10, read=30)
+            )
+            break
+        except Exception as e:
+            print(f"Attempt {attempt + 1} failed: {e}")
+            if attempt == max_retries - 1:
+                return {
+                    'statusCode': 502,
+                    'headers': {'content-type': 'text/plain'},
+                    'body': f'Bad Gateway: Failed to connect to container after {max_retries} attempts - {str(e)}'
+                }
+            time.sleep(2)
+
+    # Build response headers
+    response_headers = dict(resp.headers)
+
+    # Remove hop-by-hop headers
+    for h in ['content-encoding', 'transfer-encoding', 'connection']:
+        response_headers.pop(h, None)
+
+    # Determine if response should be base64 encoded
+    content_type = response_headers.get('content-type', '').lower()
+    is_binary = not (
+        content_type.startswith('text/') or
+        content_type.startswith('application/json') or
+        content_type.startswith('application/xml') or
+        'charset' in content_type
+    )
+
+    if is_binary:
+        return {
+            'statusCode': resp.status,
+            'headers': response_headers,
+            'body': base64.b64encode(resp.data).decode('utf-8'),
+            'isBase64Encoded': True
+        }
+    else:
+        try:
+            body_text = resp.data.decode('utf-8')
+            return {
+                'statusCode': resp.status,
+                'headers': response_headers,
+                'body': body_text,
+                'isBase64Encoded': False
+            }
+        except UnicodeDecodeError:
+            return {
+                'statusCode': resp.status,
+                'headers': response_headers,
+                'body': base64.b64encode(resp.data).decode('utf-8'),
+                'isBase64Encoded': True
+            }
+
+def lambda_handler(event, context):
+    """Main Lambda handler with zero-scaling support"""
+    try:
+        headers = {k.lower(): v for k, v in event.get('headers', {}).items()}
+        method = event['requestContext']['http']['method']
+        path = event['requestContext']['http']['path']
+
+        print(f"Processing {method} {path}")
+
+        # Get or generate user UUID
+        uuid = parse_uuid(headers)
+        print(f"User UUID: {uuid}")
+
+        # Track user visit (this updates the last request time)
+        track_user_visit(uuid, method, path)
+
+        # Get available container (will scale up if needed)
+        try:
+            container_ip = get_available_container()
+            print(f"Selected container IP: {container_ip}")
+        except RuntimeError as e:
+            print(f"Failed to get container: {e}")
+            return {
+                'statusCode': 503,
+                'headers': {
+                    'content-type': 'text/html',
+                    'set-cookie': f'uuid={uuid}; Path=/; SameSite=Lax; Max-Age=86400'
+                },
+                'body': '''
+                <html><body>
+                <h1>Service Starting Up</h1>
+                <p>Your container is starting up, please wait...</p>
+                <script>
+                setTimeout(function(){ 
+                    window.location.reload(); 
+                }, 5000);
+                </script>
+                </body></html>
+                '''
+            }
+
+        # Proxy request to container
+        response = proxy_request(event, container_ip)
+
+        # Set UUID cookie
+        response['headers']['set-cookie'] = f'uuid={uuid}; Path=/; SameSite=Lax; Max-Age=86400'
+
+        # Add CORS headers
+        if 'access-control-allow-origin' not in response['headers']:
+            response['headers']['Access-Control-Allow-Origin'] = '*'
+            response['headers']['Access-Control-Allow-Credentials'] = 'true'
+
+        return response
+
+    except Exception as e:
+        print(f"Lambda handler error: {str(e)}")
+        return {
+            'statusCode': 500,
+            'headers': {'content-type': 'text/plain'},
+            'body': f'Internal Server Error: {str(e)}'
+        }
