@@ -1,0 +1,153 @@
+import boto3
+import os
+import time
+import json
+
+# AWS clients
+ecs = boto3.client('ecs')
+ddb = boto3.resource('dynamodb')
+
+# Environment variables
+CLUSTER = os.environ['CLUSTER']
+SERVICE_NAME = os.environ['SERVICE_NAME']
+TABLE_NAME = os.environ.get('DYNAMODB_TABLE', 'session')
+IDLE_TIMEOUT = int(os.environ.get('IDLE_TIMEOUT', '300'))  # 5 minutes
+
+TABLE = ddb.Table(TABLE_NAME)
+
+def get_last_request_time():
+    """Get the timestamp of the last request"""
+    try:
+        response = TABLE.get_item(Key={'uuid': 'SYSTEM_LAST_REQUEST'})
+        if 'Item' in response:
+            return response['Item']['lastRequestTime']
+        return 0
+    except Exception as e:
+        print(f"Error getting last request time: {e}")
+        return 0
+
+def get_current_service_desired_count():
+    """Get the current desired count of the service"""
+    try:
+        response = ecs.describe_services(
+            cluster=CLUSTER,
+            services=[SERVICE_NAME]
+        )
+        
+        if not response['services']:
+            print(f"Service {SERVICE_NAME} not found in cluster {CLUSTER}")
+            return 0
+            
+        service = response['services'][0]
+        desired_count = service['desiredCount']
+        running_count = service['runningCount']
+        
+        print(f"Service status - Desired: {desired_count}, Running: {running_count}")
+        return desired_count
+        
+    except Exception as e:
+        print(f"Error getting service desired count: {e}")
+        return 0
+
+def scale_service_to_zero():
+    """Scale the ECS service to 0"""
+    try:
+        print(f"Scaling service {SERVICE_NAME} to 0...")
+        
+        response = ecs.update_service(
+            cluster=CLUSTER,
+            service=SERVICE_NAME,
+            desiredCount=0
+        )
+        
+        print(f"Service scaled to 0 successfully. New desired count: {response['service']['desiredCount']}")
+        return True
+        
+    except Exception as e:
+        print(f"Error scaling service to 0: {e}")
+        return False
+
+def lambda_handler(event, context):
+    """Scale down service if idle for too long"""
+    try:
+        print(f"Starting scale-down check for service: {SERVICE_NAME} in cluster: {CLUSTER}")
+        
+        # Get current service status
+        current_count = get_current_service_desired_count()
+        print(f"Current service desired count: {current_count}")
+        
+        if current_count == 0:
+            print("Service already at 0 desired count, nothing to do")
+            return {
+                'statusCode': 200,
+                'body': json.dumps({
+                    'message': 'Service already scaled to 0',
+                    'desiredCount': current_count
+                })
+            }
+        
+        # Get last request time
+        last_request = get_last_request_time()
+        if last_request == 0:
+            print("No last request time found in DynamoDB, skipping scale down")
+            return {
+                'statusCode': 200,
+                'body': json.dumps({
+                    'message': 'No request history found, keeping service running',
+                    'desiredCount': current_count
+                })
+            }
+        
+        # Calculate idle time
+        current_time = int(time.time())
+        idle_time = current_time - last_request
+        print(f"Last request: {last_request}, Current time: {current_time}")
+        print(f"Service idle time: {idle_time} seconds (threshold: {IDLE_TIMEOUT} seconds)")
+        
+        if idle_time > IDLE_TIMEOUT:
+            print(f"Service idle for {idle_time}s (>{IDLE_TIMEOUT}s), scaling to 0")
+            
+            if scale_service_to_zero():
+                return {
+                    'statusCode': 200,
+                    'body': json.dumps({
+                        'message': 'Service scaled to 0 due to inactivity',
+                        'idleTime': idle_time,
+                        'threshold': IDLE_TIMEOUT,
+                        'previousDesiredCount': current_count,
+                        'newDesiredCount': 0
+                    })
+                }
+            else:
+                return {
+                    'statusCode': 500,
+                    'body': json.dumps({
+                        'message': 'Failed to scale service to 0',
+                        'idleTime': idle_time
+                    })
+                }
+        else:
+            time_until_scale = IDLE_TIMEOUT - idle_time
+            print(f"Service still active, {time_until_scale}s remaining until scale down")
+            
+            return {
+                'statusCode': 200,
+                'body': json.dumps({
+                    'message': 'Service still active, no scaling needed',
+                    'idleTime': idle_time,
+                    'timeUntilScaleDown': time_until_scale,
+                    'desiredCount': current_count
+                })
+            }
+            
+    except Exception as e:
+        error_message = f"Scale down error: {str(e)}"
+        print(error_message)
+        
+        return {
+            'statusCode': 500,
+            'body': json.dumps({
+                'message': 'Error during scale down check',
+                'error': str(e)
+            })
+        }
