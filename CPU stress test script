@@ -1,0 +1,97 @@
+#!/bin/bash
+
+# CPU Stress Test Script for ECS Container via API Gateway
+# This script sends concurrent requests to stress CPU usage
+
+# Configuration
+API_URL="https://your-api-id.execute-api.region.amazonaws.com/stage"
+CONCURRENT_REQUESTS=50
+TOTAL_REQUESTS=1000
+DURATION_SECONDS=300  # 5 minutes
+
+echo "=== CPU Stress Test Starting ==="
+echo "API URL: $API_URL"
+echo "Concurrent requests: $CONCURRENT_REQUESTS"
+echo "Total requests: $TOTAL_REQUESTS"
+echo "Duration: $DURATION_SECONDS seconds"
+echo "================================="
+
+# Function to make a single request
+make_request() {
+    local request_id=$1
+    local timestamp=$(date +%s%N)
+    
+    # Add cache-busting parameters and CPU-intensive query params
+    local url="${API_URL}?bust=${timestamp}&id=${request_id}&compute=heavy&loops=1000"
+    
+    curl -s -w "%{http_code},%{time_total},%{size_download}\n" \
+         -o /dev/null \
+         --max-time 30 \
+         "$url"
+}
+
+# Export function for parallel execution
+export -f make_request
+export API_URL
+
+# Create request sequence
+seq 1 $TOTAL_REQUESTS > /tmp/request_ids.txt
+
+echo "Starting stress test at $(date)"
+start_time=$(date +%s)
+
+# Run requests in parallel with limited concurrency
+cat /tmp/request_ids.txt | xargs -n 1 -P $CONCURRENT_REQUESTS -I {} bash -c 'make_request {}' > /tmp/results.txt &
+
+STRESS_PID=$!
+
+# Monitor progress
+while kill -0 $STRESS_PID 2>/dev/null; do
+    current_time=$(date +%s)
+    elapsed=$((current_time - start_time))
+    
+    if [ $elapsed -ge $DURATION_SECONDS ]; then
+        echo "Duration reached, stopping stress test..."
+        kill $STRESS_PID 2>/dev/null
+        break
+    fi
+    
+    completed_requests=$(wc -l < /tmp/results.txt 2>/dev/null || echo 0)
+    echo "$(date): Completed $completed_requests requests, Elapsed: ${elapsed}s"
+    sleep 10
+done
+
+wait $STRESS_PID 2>/dev/null
+
+# Analyze results
+echo ""
+echo "=== Results ==="
+total_requests=$(wc -l < /tmp/results.txt)
+successful_requests=$(grep -c "^200," /tmp/results.txt)
+failed_requests=$((total_requests - successful_requests))
+
+end_time=$(date +%s)
+total_duration=$((end_time - start_time))
+
+echo "Total requests sent: $total_requests"
+echo "Successful requests: $successful_requests"
+echo "Failed requests: $failed_requests"
+echo "Total duration: $total_duration seconds"
+echo "Requests per second: $((successful_requests / total_duration))"
+
+if [ $successful_requests -gt 0 ]; then
+    avg_response_time=$(awk -F',' '/^200,/ { sum += $2; count++ } END { if(count > 0) print sum/count }' /tmp/results.txt)
+    echo "Average response time: ${avg_response_time}s"
+fi
+
+# Show some sample response times
+echo ""
+echo "Sample response times (first 10 successful requests):"
+grep "^200," /tmp/results.txt | head -10 | awk -F',' '{ print "Request time: " $2 "s, Size: " $3 " bytes" }'
+
+# Cleanup
+rm -f /tmp/request_ids.txt /tmp/results.txt
+
+echo ""
+echo "CPU stress test completed at $(date)"
+echo "Check CloudWatch metrics in 2-3 minutes for CPU utilization spikes"
