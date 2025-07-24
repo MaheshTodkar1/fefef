@@ -1,0 +1,152 @@
+#chmod +x cpu_stress.sh
+#chmod +x memory_stress.sh
+
+#!/bin/bash
+
+# Memory Stress Test Script for ECS Container via API Gateway
+# This script sends requests with large payloads to stress memory usage
+
+# Configuration
+API_URL="https://your-api-id.execute-api.region.amazonaws.com/stage"
+CONCURRENT_REQUESTS=20
+TOTAL_REQUESTS=500
+PAYLOAD_SIZE_MB=5
+DURATION_SECONDS=300  # 5 minutes
+
+echo "=== Memory Stress Test Starting ==="
+echo "API URL: $API_URL"
+echo "Concurrent requests: $CONCURRENT_REQUESTS"
+echo "Total requests: $TOTAL_REQUESTS"
+echo "Payload size: ${PAYLOAD_SIZE_MB}MB per request"
+echo "Duration: $DURATION_SECONDS seconds"
+echo "===================================="
+
+# Create large payload file
+echo "Generating ${PAYLOAD_SIZE_MB}MB payload..."
+dd if=/dev/zero of=/tmp/large_payload.dat bs=1M count=$PAYLOAD_SIZE_MB 2>/dev/null
+
+# Function to make a memory-intensive request
+make_memory_request() {
+    local request_id=$1
+    local timestamp=$(date +%s%N)
+    
+    # URL with memory-intensive parameters
+    local url="${API_URL}?bust=${timestamp}&id=${request_id}&memory=stress&size=${PAYLOAD_SIZE_MB}MB"
+    
+    # Send POST request with large payload
+    curl -s -w "%{http_code},%{time_total},%{size_download},%{size_upload}\n" \
+         -o /dev/null \
+         --max-time 60 \
+         -X POST \
+         -H "Content-Type: application/octet-stream" \
+         -H "X-Memory-Test: true" \
+         --data-binary @/tmp/large_payload.dat \
+         "$url"
+}
+
+# Also create GET requests with large response expectations
+make_memory_get_request() {
+    local request_id=$1
+    local timestamp=$(date +%s%N)
+    
+    # Request large response from server
+    local url="${API_URL}?bust=${timestamp}&id=${request_id}&response_size=${PAYLOAD_SIZE_MB}MB&memory_intensive=true"
+    
+    curl -s -w "%{http_code},%{time_total},%{size_download}\n" \
+         -o /tmp/response_${request_id}.dat \
+         --max-time 60 \
+         "$url"
+    
+    # Clean up response file immediately to free memory
+    rm -f /tmp/response_${request_id}.dat 2>/dev/null
+}
+
+# Export functions
+export -f make_memory_request
+export -f make_memory_get_request
+export API_URL
+
+# Create request sequence
+seq 1 $TOTAL_REQUESTS > /tmp/memory_request_ids.txt
+
+echo "Starting memory stress test at $(date)"
+start_time=$(date +%s)
+
+# Run mixed POST and GET requests in parallel
+{
+    # Half requests as POST with large payload
+    head -n $((TOTAL_REQUESTS / 2)) /tmp/memory_request_ids.txt | \
+    xargs -n 1 -P $((CONCURRENT_REQUESTS / 2)) -I {} bash -c 'make_memory_request {}'
+    
+    # Half requests as GET expecting large response
+    tail -n $((TOTAL_REQUESTS / 2)) /tmp/memory_request_ids.txt | \
+    xargs -n 1 -P $((CONCURRENT_REQUESTS / 2)) -I {} bash -c 'make_memory_get_request {}'
+} > /tmp/memory_results.txt &
+
+STRESS_PID=$!
+
+# Monitor progress and memory usage
+while kill -0 $STRESS_PID 2>/dev/null; do
+    current_time=$(date +%s)
+    elapsed=$((current_time - start_time))
+    
+    if [ $elapsed -ge $DURATION_SECONDS ]; then
+        echo "Duration reached, stopping memory stress test..."
+        kill $STRESS_PID 2>/dev/null
+        break
+    fi
+    
+    completed_requests=$(wc -l < /tmp/memory_results.txt 2>/dev/null || echo 0)
+    local_memory_usage=$(free -m | awk '/^Mem:/ { printf "%.1f%%", ($3/$2 * 100) }')
+    
+    echo "$(date): Completed $completed_requests requests, Elapsed: ${elapsed}s, Local Memory: $local_memory_usage"
+    sleep 15
+done
+
+wait $STRESS_PID 2>/dev/null
+
+# Analyze results
+echo ""
+echo "=== Memory Stress Test Results ==="
+total_requests=$(wc -l < /tmp/memory_results.txt)
+successful_requests=$(grep -c "^200," /tmp/memory_results.txt)
+failed_requests=$((total_requests - successful_requests))
+
+end_time=$(date +%s)
+total_duration=$((end_time - start_time))
+
+echo "Total requests sent: $total_requests"
+echo "Successful requests: $successful_requests"
+echo "Failed requests: $failed_requests"
+echo "Total duration: $total_duration seconds"
+echo "Requests per second: $((successful_requests / total_duration))"
+
+if [ $successful_requests -gt 0 ]; then
+    avg_response_time=$(awk -F',' '/^200,/ { sum += $2; count++ } END { if(count > 0) print sum/count }' /tmp/memory_results.txt)
+    echo "Average response time: ${avg_response_time}s"
+    
+    # Calculate total data transferred
+    total_upload=$(awk -F',' '/^200,/ && NF>=4 { sum += $4 } END { print sum+0 }' /tmp/memory_results.txt)
+    total_download=$(awk -F',' '/^200,/ { sum += $3 } END { print sum+0 }' /tmp/memory_results.txt)
+    
+    echo "Total data uploaded: $((total_upload / 1024 / 1024))MB"
+    echo "Total data downloaded: $((total_download / 1024 / 1024))MB"
+fi
+
+# Show memory usage pattern
+echo ""
+echo "Sample response times and sizes:"
+grep "^200," /tmp/memory_results.txt | head -10 | \
+awk -F',' '{ printf "Time: %.3fs, Download: %.1fMB", $2, $3/1024/1024; if(NF>=4) printf ", Upload: %.1fMB", $4/1024/1024; print "" }'
+
+# Cleanup
+rm -f /tmp/large_payload.dat /tmp/memory_request_ids.txt /tmp/memory_results.txt /tmp/response_*.dat 2>/dev/null
+
+echo ""
+echo "Memory stress test completed at $(date)"
+echo "Check CloudWatch metrics in 2-3 minutes for Memory utilization spikes"
+
+# Final system memory check
+echo ""
+echo "Final local system memory usage:"
+free -h
