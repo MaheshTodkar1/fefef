@@ -1,0 +1,44 @@
+Now, here are the AWS Console Steps:AWS Console Setup StepsStep 1: Create Scale-Down Lambda FunctionGo to AWS Lambda ConsoleNavigate to: AWS Console → Lambda → FunctionsClick "Create function"Configure FunctionChoose: "Author from scratch"Function name: ecs-scale-down-lambdaRuntime: Python 3.9 (or later)Architecture: x86_64 (or ARM64 for cost savings)Click "Create function"Add CodeIn the Code source sectionDelete default code and paste the scale_down_lambda.py codeClick "Deploy"Configure Environment VariablesGo to Configuration tab → Environment variablesClick "Edit" → "Add environment variable"Add these variables:CLUSTER = your-ecs-cluster-name
+SERVICE_NAME = your-ecs-service-name
+DYNAMODB_TABLE = session
+IDLE_TIMEOUT = 300Click "Save"Configure TimeoutGo to Configuration tab → General configurationClick "Edit"Set Timeout to: 1 minuteClick "Save"Step 2: Create IAM Role for Scale-Down LambdaGo to IAM ConsoleNavigate to: AWS Console → IAM → RolesClick "Create role"Select Trusted EntityChoose: AWS serviceUse case: LambdaClick "Next"Add PermissionsSearch and select: AWSLambdaBasicExecutionRoleClick "Next"Role name: lambda-ecs-scale-down-roleClick "Create role"Add Custom PolicyFind your new role → Click on itGo to Permissions tabClick "Add permissions" → "Create inline policy"Switch to JSON tab and paste:{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "ecs:UpdateService",
+                "ecs:DescribeServices"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "dynamodb:GetItem"
+            ],
+            "Resource": "arn:aws:dynamodb:*:*:table/session"
+        }
+    ]
+}Policy name: ECS-Scale-Down-PolicyClick "Create policy"Attach Role to LambdaGo back to Lambda functionConfiguration tab → Execution roleClick "Edit"Select: lambda-ecs-scale-down-roleClick "Save"Step 3: Create EventBridge RuleGo to EventBridge ConsoleNavigate to: AWS Console → EventBridge → RulesClick "Create rule"Configure RuleName: ecs-scale-down-scheduleDescription: Trigger ECS scale-down Lambda every minuteEvent bus: defaultRule type: ScheduleClick "Next"Define ScheduleSchedule pattern: Rate-based scheduleRate expression: rate(1 minute)Click "Next"Select TargetTarget type: AWS serviceSelect a target: Lambda functionFunction: ecs-scale-down-lambdaClick "Next"Configure SettingsNo additional settings neededClick "Next"Review and click "Create rule"Step 4: Update Main Lambda IAM RoleGo to your existing main Lambda functionConfiguration tab → Execution roleClick on the role name (opens IAM)Add ECS PermissionsIn IAM role → Permissions tabClick "Add permissions" → "Create inline policy"Use JSON and paste:{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "ecs:UpdateService",
+                "ecs:DescribeServices",
+                "ecs:ListTasks",
+                "ecs:DescribeTasks"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "ec2:DescribeNetworkInterfaces"
+            ],
+            "Resource": "*"
+        }
+    ]
+}Policy name: ECS-Main-Lambda-PolicyClick "Create policy"Step 5: Configure ECS Auto Scaling (Optional)Go to ECS ConsoleNavigate to: AWS Console → ECS → ClustersClick your cluster → Services tabClick your service nameUpdate ServiceClick "Update service"In Service configuration:Desired tasks: 0Minimum healthy percent: 0Maximum percent: 200Click "Update service"Configure Auto ScalingIn service details → Auto Scaling tabClick "Create" or "Update"Minimum capacity: 0Maximum capacity: 5Add scaling policies based on CPU/MemoryStep 6: Test the SetupCheck Initial StateECS Console → Your service should show Desired: 0, Running: 0Make a RequestSend request to your API GatewayCheck Lambda logs in CloudWatchVerify ECS service scales to 1Wait for Scale DownWait 5+ minutes without requestsCheck scale-down Lambda logsVerify service scales back to 0MonitoringCloudWatch Logs:/aws/lambda/your-main-lambda-name/aws/lambda/ecs-scale-down-lambdaECS Service Events: ECS Console → Service → Events tabEventBridge Rule: EventBridge Console → Rules → View metricsThis setup provides true zero-scaling with proper monitoring and logging
