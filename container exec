@@ -1,0 +1,50 @@
+its showing unknown option forcee deployement
+
+Edit
+Ah, the parameter name is different! Use --force-new-deployment (with dashes, not force):
+
+bash
+aws ecs update-service --cluster YOUR_CLUSTER_NAME --service YOUR_SERVICE_NAME --enable-execute-command --force-new-deployment
+If that still doesn't work, try without the force deployment flag first:
+
+bash
+aws ecs update-service --cluster YOUR_CLUSTER_NAME --service YOUR_SERVICE_NAME --enable-execute-command
+The --force-new-deployment just ensures new tasks are created immediately with ECS Exec enabled. Without it, you'd need to wait for the service to naturally replace tasks.
+
+What's the exact error now?
+
+
+
+
+
+an error occure when calling update service operation the service couldent be updated because a valid taskrolearn  is not being used, specify the valueid task role in your task defination and try again
+
+Edit
+This error means your ECS task definition doesn't have the required IAM role for ECS Exec. You need to add a task role with specific permissions.
+
+Fix this by updating your Task Definition:
+Step 1: Create/Find the Required IAM Role
+Go to IAM Console → Roles
+Look for a role with ECS Task Role trust policy, or create a new one
+The role needs this permission policy: AmazonECSTaskExecutionRolePolicy
+For ECS Exec, it also needs: AmazonSSMManagedInstanceCore
+Step 2: Update Task Definition
+Go to ECS Console → Task Definitions
+Click your task definition → Create new revision
+Scroll to Task role dropdown
+Select the IAM role you found/created
+Click Create
+Step 3: Update Service to Use New Task Definition
+Go to your Service → Update
+Under Task Definition, select the new revision
+Click Update
+Quick IAM Role Creation (if needed):
+IAM → Roles → Create role
+Select AWS service → Elastic Container Service → Elastic Container Service Task
+Attach policies:
+AmazonECSTaskExecutionRolePolicy
+AmazonSSMManagedInstanceCore
+Name it something like ecsTaskRole
+After updating the task definition with the task role, try the ECS Exec command again.
+
+Which step do you need help with first - creating the IAM role or updating the task definition?
