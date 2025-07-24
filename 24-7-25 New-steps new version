@@ -1,0 +1,700 @@
+I'll provide the AWS Console steps and separate Lambda files for both functions.
+
+## AWS Console Setup Steps
+
+### Step 1: Create the Scale-Down Lambda Function
+
+import json
+import os
+import time
+import base64
+import uuid as uuidlib
+import urllib3
+from datetime import datetime
+import boto3
+from http.cookies import SimpleCookie
+
+# AWS clients
+ecs = boto3.client('ecs')
+ec2 = boto3.client('ec2')
+ddb = boto3.resource('dynamodb')
+
+# Environment variables
+CLUSTER = os.environ['CLUSTER']
+SERVICE_NAME = os.environ['SERVICE_NAME']
+CONTAINER_PORT = int(os.environ.get('CONTAINER_PORT', '80'))
+TABLE_NAME = os.environ.get('DYNAMODB_TABLE', 'session')
+SCALE_UP_TIMEOUT = int(os.environ.get('SCALE_UP_TIMEOUT', '180'))
+
+# Initialize resources
+TABLE = ddb.Table(TABLE_NAME)
+http_pool = urllib3.PoolManager()
+
+def parse_uuid(headers):
+    """Extract or generate UUID from Cookie header"""
+    raw = headers.get('cookie', '')
+    cookies = SimpleCookie()
+    cookies.load(raw)
+
+    if 'uuid' in cookies:
+        return cookies['uuid'].value
+
+    new_uuid = str(uuidlib.uuid4())
+    return new_uuid
+
+def update_last_request_time():
+    """Update the last request timestamp in DynamoDB for scale-down tracking"""
+    try:
+        now = int(time.time())
+        TABLE.put_item(Item={
+            'uuid': 'SYSTEM_LAST_REQUEST',
+            'lastRequestTime': now,
+            'expires': now + 86400  # 24 hours
+        })
+        print(f"Updated last request time: {now}")
+    except Exception as e:
+        print(f"Error updating last request time: {e}")
+
+def track_user_visit(uuid, method, path):
+    """Store/update user visit in DynamoDB"""
+    try:
+        now = int(time.time())
+
+        # Update system-wide last request time for scale-down logic
+        update_last_request_time()
+
+        # Check if user already exists
+        try:
+            response = TABLE.get_item(Key={'uuid': uuid})
+            if 'Item' in response:
+                TABLE.update_item(
+                    Key={'uuid': uuid},
+                    UpdateExpression='SET expires = :exp, #status = :status, lastPath = :path, lastMethod = :method',
+                    ExpressionAttributeNames={'#status': 'status'},
+                    ExpressionAttributeValues={
+                        ':exp': now + 7200,
+                        ':status': 'active',
+                        ':path': path,
+                        ':method': method
+                    }
+                )
+                print(f"Updated existing user {uuid}: {method} {path}")
+            else:
+                TABLE.put_item(Item={
+                    'uuid': uuid,
+                    'createdAt': now,
+                    'expires': now + 7200,
+                    'publicIp': 'service-managed',
+                    'status': 'active',
+                    'taskArn': 'service-managed',
+                    'lastPath': path,
+                    'lastMethod': method
+                })
+                print(f"Created new user record {uuid}: {method} {path}")
+        except Exception as e:
+            print(f"Error accessing DynamoDB: {e}")
+
+    except Exception as e:
+        print(f"Error tracking user visit: {e}")
+
+def get_service_tasks():
+    """Get all running tasks from the ECS service"""
+    try:
+        task_arns = ecs.list_tasks(
+            cluster=CLUSTER,
+            serviceName=SERVICE_NAME,
+            desiredStatus='RUNNING'
+        )['taskArns']
+
+        if not task_arns:
+            return []
+
+        tasks_response = ecs.describe_tasks(
+            cluster=CLUSTER,
+            tasks=task_arns
+        )
+
+        running_tasks = []
+        for task in tasks_response['tasks']:
+            if task['lastStatus'] == 'RUNNING':
+                try:
+                    details = task['attachments'][0]['details']
+                    eni_id = next(d['value'] for d in details if d['name'] == 'networkInterfaceId')
+
+                    iface = ec2.describe_network_interfaces(NetworkInterfaceIds=[eni_id])['NetworkInterfaces'][0]
+                    public_ip = iface.get('Association', {}).get('PublicIp')
+
+                    if public_ip:
+                        running_tasks.append({
+                            'taskArn': task['taskArn'],
+                            'publicIp': public_ip
+                        })
+                        print(f"Found running task with IP: {public_ip}")
+                except Exception as e:
+                    print(f"Error getting IP for task {task['taskArn']}: {e}")
+                    continue
+
+        return running_tasks
+    except Exception as e:
+        print(f"Error getting service tasks: {e}")
+        return []
+
+def scale_service_to_count(desired_count):
+    """Scale the ECS service to specified count"""
+    try:
+        print(f"Scaling service to {desired_count} tasks...")
+        ecs.update_service(
+            cluster=CLUSTER,
+            service=SERVICE_NAME,
+            desiredCount=desired_count
+        )
+        print(f"Service scale request sent successfully to {desired_count}")
+        return True
+    except Exception as e:
+        print(f"Error scaling service: {e}")
+        return False
+
+def wait_for_running_task():
+    """Wait for at least one task to be in RUNNING state"""
+    print("Waiting for task to start...")
+    start_time = time.time()
+    
+    while time.time() - start_time < SCALE_UP_TIMEOUT:
+        tasks = get_service_tasks()
+        if tasks:
+            print(f"Task is running! Found {len(tasks)} running tasks")
+            return tasks[0]['publicIp']
+        
+        print("Still waiting for task to start...")
+        time.sleep(5)
+    
+    raise TimeoutError(f"Task did not start within {SCALE_UP_TIMEOUT} seconds")
+
+def get_available_container():
+    """Get an available container IP from the service, scaling up if necessary"""
+    import random
+
+    # Check if any tasks are already running
+    tasks = get_service_tasks()
+    
+    if tasks:
+        selected_task = random.choice(tasks)
+        print(f"Using existing running task: {selected_task['publicIp']}")
+        return selected_task['publicIp']
+    
+    # No tasks running - need to scale up from 0
+    print("No running tasks found. Initiating scale from 0 to 1...")
+    
+    if not scale_service_to_count(1):
+        raise RuntimeError("Failed to initiate service scaling")
+    
+    # Wait for the task to start and return its IP
+    try:
+        container_ip = wait_for_running_task()
+        print(f"Successfully scaled up and got container IP: {container_ip}")
+        return container_ip
+    except TimeoutError as e:
+        raise RuntimeError(f"Scale-up failed: {str(e)}")
+
+def proxy_request(event, container_ip):
+    """Forward the API Gateway event to the container and return Lambda response"""
+    method = event['requestContext']['http']['method']
+    path = event['requestContext']['http']['path']
+    query = event.get('rawQueryString', '')
+
+    url = f'http://{container_ip}:{CONTAINER_PORT}{path}'
+    if query:
+        url += f'?{query}'
+
+    print(f"Proxying {method} {url}")
+
+    headers = {k: v for k, v in event.get('headers', {}).items()}
+    headers['host'] = f'{container_ip}:{CONTAINER_PORT}'
+
+    body = event.get('body', '')
+    if event.get('isBase64Encoded', False):
+        body = base64.b64decode(body)
+
+    # Send request to container with retries
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            resp = http_pool.request(
+                method, url,
+                headers=headers,
+                body=body,
+                timeout=urllib3.Timeout(connect=10, read=30)
+            )
+            break
+        except Exception as e:
+            print(f"Attempt {attempt + 1} failed: {e}")
+            if attempt == max_retries - 1:
+                return {
+                    'statusCode': 502,
+                    'headers': {'content-type': 'text/plain'},
+                    'body': f'Bad Gateway: Failed to connect to container after {max_retries} attempts - {str(e)}'
+                }
+            time.sleep(2)
+
+    # Build response headers
+    response_headers = dict(resp.headers)
+
+    # Remove hop-by-hop headers
+    for h in ['content-encoding', 'transfer-encoding', 'connection']:
+        response_headers.pop(h, None)
+
+    # Determine if response should be base64 encoded
+    content_type = response_headers.get('content-type', '').lower()
+    is_binary = not (
+        content_type.startswith('text/') or
+        content_type.startswith('application/json') or
+        content_type.startswith('application/xml') or
+        'charset' in content_type
+    )
+
+    if is_binary:
+        return {
+            'statusCode': resp.status,
+            'headers': response_headers,
+            'body': base64.b64encode(resp.data).decode('utf-8'),
+            'isBase64Encoded': True
+        }
+    else:
+        try:
+            body_text = resp.data.decode('utf-8')
+            return {
+                'statusCode': resp.status,
+                'headers': response_headers,
+                'body': body_text,
+                'isBase64Encoded': False
+            }
+        except UnicodeDecodeError:
+            return {
+                'statusCode': resp.status,
+                'headers': response_headers,
+                'body': base64.b64encode(resp.data).decode('utf-8'),
+                'isBase64Encoded': True
+            }
+
+def lambda_handler(event, context):
+    """Main Lambda handler with zero-scaling support"""
+    try:
+        headers = {k.lower(): v for k, v in event.get('headers', {}).items()}
+        method = event['requestContext']['http']['method']
+        path = event['requestContext']['http']['path']
+
+        print(f"Processing {method} {path}")
+
+        # Get or generate user UUID
+        uuid = parse_uuid(headers)
+        print(f"User UUID: {uuid}")
+
+        # Track user visit (this updates the last request time)
+        track_user_visit(uuid, method, path)
+
+        # Get available container (will scale up if needed)
+        try:
+            container_ip = get_available_container()
+            print(f"Selected container IP: {container_ip}")
+        except RuntimeError as e:
+            print(f"Failed to get container: {e}")
+            return {
+                'statusCode': 503,
+                'headers': {
+                    'content-type': 'text/html',
+                    'set-cookie': f'uuid={uuid}; Path=/; SameSite=Lax; Max-Age=86400'
+                },
+                'body': '''
+                <html><body>
+                <h1>Service Starting Up</h1>
+                <p>Your container is starting up, please wait...</p>
+                <script>
+                setTimeout(function(){ 
+                    window.location.reload(); 
+                }, 5000);
+                </script>
+                </body></html>
+                '''
+            }
+
+        # Proxy request to container
+        response = proxy_request(event, container_ip)
+
+        # Set UUID cookie
+        response['headers']['set-cookie'] = f'uuid={uuid}; Path=/; SameSite=Lax; Max-Age=86400'
+
+        # Add CORS headers
+        if 'access-control-allow-origin' not in response['headers']:
+            response['headers']['Access-Control-Allow-Origin'] = '*'
+            response['headers']['Access-Control-Allow-Credentials'] = 'true'
+
+        return response
+
+    except Exception as e:
+        print(f"Lambda handler error: {str(e)}")
+        return {
+            'statusCode': 500,
+            'headers': {'content-type': 'text/plain'},
+            'body': f'Internal Server Error: {str(e)}'
+        }
+
+import boto3
+import os
+import time
+import json
+
+# AWS clients
+ecs = boto3.client('ecs')
+ddb = boto3.resource('dynamodb')
+
+# Environment variables
+CLUSTER = os.environ['CLUSTER']
+SERVICE_NAME = os.environ['SERVICE_NAME']
+TABLE_NAME = os.environ.get('DYNAMODB_TABLE', 'session')
+IDLE_TIMEOUT = int(os.environ.get('IDLE_TIMEOUT', '300'))  # 5 minutes
+
+TABLE = ddb.Table(TABLE_NAME)
+
+def get_last_request_time():
+    """Get the timestamp of the last request"""
+    try:
+        response = TABLE.get_item(Key={'uuid': 'SYSTEM_LAST_REQUEST'})
+        if 'Item' in response:
+            return response['Item']['lastRequestTime']
+        return 0
+    except Exception as e:
+        print(f"Error getting last request time: {e}")
+        return 0
+
+def get_current_service_desired_count():
+    """Get the current desired count of the service"""
+    try:
+        response = ecs.describe_services(
+            cluster=CLUSTER,
+            services=[SERVICE_NAME]
+        )
+        
+        if not response['services']:
+            print(f"Service {SERVICE_NAME} not found in cluster {CLUSTER}")
+            return 0
+            
+        service = response['services'][0]
+        desired_count = service['desiredCount']
+        running_count = service['runningCount']
+        
+        print(f"Service status - Desired: {desired_count}, Running: {running_count}")
+        return desired_count
+        
+    except Exception as e:
+        print(f"Error getting service desired count: {e}")
+        return 0
+
+def scale_service_to_zero():
+    """Scale the ECS service to 0"""
+    try:
+        print(f"Scaling service {SERVICE_NAME} to 0...")
+        
+        response = ecs.update_service(
+            cluster=CLUSTER,
+            service=SERVICE_NAME,
+            desiredCount=0
+        )
+        
+        print(f"Service scaled to 0 successfully. New desired count: {response['service']['desiredCount']}")
+        return True
+        
+    except Exception as e:
+        print(f"Error scaling service to 0: {e}")
+        return False
+
+def lambda_handler(event, context):
+    """Scale down service if idle for too long"""
+    try:
+        print(f"Starting scale-down check for service: {SERVICE_NAME} in cluster: {CLUSTER}")
+        
+        # Get current service status
+        current_count = get_current_service_desired_count()
+        print(f"Current service desired count: {current_count}")
+        
+        if current_count == 0:
+            print("Service already at 0 desired count, nothing to do")
+            return {
+                'statusCode': 200,
+                'body': json.dumps({
+                    'message': 'Service already scaled to 0',
+                    'desiredCount': current_count
+                })
+            }
+        
+        # Get last request time
+        last_request = get_last_request_time()
+        if last_request == 0:
+            print("No last request time found in DynamoDB, skipping scale down")
+            return {
+                'statusCode': 200,
+                'body': json.dumps({
+                    'message': 'No request history found, keeping service running',
+                    'desiredCount': current_count
+                })
+            }
+        
+        # Calculate idle time
+        current_time = int(time.time())
+        idle_time = current_time - last_request
+        print(f"Last request: {last_request}, Current time: {current_time}")
+        print(f"Service idle time: {idle_time} seconds (threshold: {IDLE_TIMEOUT} seconds)")
+        
+        if idle_time > IDLE_TIMEOUT:
+            print(f"Service idle for {idle_time}s (>{IDLE_TIMEOUT}s), scaling to 0")
+            
+            if scale_service_to_zero():
+                return {
+                    'statusCode': 200,
+                    'body': json.dumps({
+                        'message': 'Service scaled to 0 due to inactivity',
+                        'idleTime': idle_time,
+                        'threshold': IDLE_TIMEOUT,
+                        'previousDesiredCount': current_count,
+                        'newDesiredCount': 0
+                    })
+                }
+            else:
+                return {
+                    'statusCode': 500,
+                    'body': json.dumps({
+                        'message': 'Failed to scale service to 0',
+                        'idleTime': idle_time
+                    })
+                }
+        else:
+            time_until_scale = IDLE_TIMEOUT - idle_time
+            print(f"Service still active, {time_until_scale}s remaining until scale down")
+            
+            return {
+                'statusCode': 200,
+                'body': json.dumps({
+                    'message': 'Service still active, no scaling needed',
+                    'idleTime': idle_time,
+                    'timeUntilScaleDown': time_until_scale,
+                    'desiredCount': current_count
+                })
+            }
+            
+    except Exception as e:
+        error_message = f"Scale down error: {str(e)}"
+        print(error_message)
+        
+        return {
+            'statusCode': 500,
+            'body': json.dumps({
+                'message': 'Error during scale down check',
+                'error': str(e)
+            })
+        }
+
+Now, here are the **AWS Console Steps**:
+
+## AWS Console Setup Steps
+
+### Step 1: Create Scale-Down Lambda Function
+
+1. **Go to AWS Lambda Console**
+   - Navigate to: AWS Console → Lambda → Functions
+   - Click **"Create function"**
+
+2. **Configure Function**
+   - Choose: **"Author from scratch"**
+   - Function name: `ecs-scale-down-lambda`
+   - Runtime: **Python 3.9** (or later)
+   - Architecture: **x86_64** (or ARM64 for cost savings)
+   - Click **"Create function"**
+
+3. **Add Code**
+   - In the **Code source** section
+   - Delete default code and paste the `scale_down_lambda.py` code
+   - Click **"Deploy"**
+
+4. **Configure Environment Variables**
+   - Go to **Configuration** tab → **Environment variables**
+   - Click **"Edit"** → **"Add environment variable"**
+   - Add these variables:
+     ```
+     CLUSTER = your-ecs-cluster-name
+     SERVICE_NAME = your-ecs-service-name
+     DYNAMODB_TABLE = session
+     IDLE_TIMEOUT = 300
+     ```
+   - Click **"Save"**
+
+5. **Configure Timeout**
+   - Go to **Configuration** tab → **General configuration**
+   - Click **"Edit"**
+   - Set **Timeout** to: **1 minute**
+   - Click **"Save"**
+
+### Step 2: Create IAM Role for Scale-Down Lambda
+
+1. **Go to IAM Console**
+   - Navigate to: AWS Console → IAM → Roles
+   - Click **"Create role"**
+
+2. **Select Trusted Entity**
+   - Choose: **AWS service**
+   - Use case: **Lambda**
+   - Click **"Next"**
+
+3. **Add Permissions**
+   - Search and select: **AWSLambdaBasicExecutionRole**
+   - Click **"Next"**
+   - Role name: `lambda-ecs-scale-down-role`
+   - Click **"Create role"**
+
+4. **Add Custom Policy**
+   - Find your new role → Click on it
+   - Go to **Permissions** tab
+   - Click **"Add permissions"** → **"Create inline policy"**
+   - Switch to **JSON** tab and paste:
+   ```json
+   {
+       "Version": "2012-10-17",
+       "Statement": [
+           {
+               "Effect": "Allow",
+               "Action": [
+                   "ecs:UpdateService",
+                   "ecs:DescribeServices"
+               ],
+               "Resource": "*"
+           },
+           {
+               "Effect": "Allow",
+               "Action": [
+                   "dynamodb:GetItem"
+               ],
+               "Resource": "arn:aws:dynamodb:*:*:table/session"
+           }
+       ]
+   }
+   ```
+   - Policy name: `ECS-Scale-Down-Policy`
+   - Click **"Create policy"**
+
+5. **Attach Role to Lambda**
+   - Go back to Lambda function
+   - **Configuration** tab → **Execution role**
+   - Click **"Edit"**
+   - Select: `lambda-ecs-scale-down-role`
+   - Click **"Save"**
+
+### Step 3: Create EventBridge Rule
+
+1. **Go to EventBridge Console**
+   - Navigate to: AWS Console → EventBridge → Rules
+   - Click **"Create rule"**
+
+2. **Configure Rule**
+   - Name: `ecs-scale-down-schedule`
+   - Description: `Trigger ECS scale-down Lambda every minute`
+   - Event bus: **default**
+   - Rule type: **Schedule**
+   - Click **"Next"**
+
+3. **Define Schedule**
+   - Schedule pattern: **Rate-based schedule**
+   - Rate expression: `rate(1 minute)`
+   - Click **"Next"**
+
+4. **Select Target**
+   - Target type: **AWS service**
+   - Select a target: **Lambda function**
+   - Function: `ecs-scale-down-lambda`
+   - Click **"Next"**
+
+5. **Configure Settings**
+   - No additional settings needed
+   - Click **"Next"**
+   - Review and click **"Create rule"**
+
+### Step 4: Update Main Lambda IAM Role
+
+1. **Go to your existing main Lambda function**
+   - **Configuration** tab → **Execution role**
+   - Click on the role name (opens IAM)
+
+2. **Add ECS Permissions**
+   - In IAM role → **Permissions** tab
+   - Click **"Add permissions"** → **"Create inline policy"**
+   - Use JSON and paste:
+   ```json
+   {
+       "Version": "2012-10-17",
+       "Statement": [
+           {
+               "Effect": "Allow",
+               "Action": [
+                   "ecs:UpdateService",
+                   "ecs:DescribeServices",
+                   "ecs:ListTasks",
+                   "ecs:DescribeTasks"
+               ],
+               "Resource": "*"
+           },
+           {
+               "Effect": "Allow",
+               "Action": [
+                   "ec2:DescribeNetworkInterfaces"
+               ],
+               "Resource": "*"
+           }
+       ]
+   }
+   ```
+   - Policy name: `ECS-Main-Lambda-Policy`
+   - Click **"Create policy"**
+
+### Step 5: Configure ECS Auto Scaling (Optional)
+
+1. **Go to ECS Console**
+   - Navigate to: AWS Console → ECS → Clusters
+   - Click your cluster → Services tab
+   - Click your service name
+
+2. **Update Service**
+   - Click **"Update service"**
+   - In **Service configuration**:
+     - **Desired tasks**: 0
+     - **Minimum healthy percent**: 0
+     - **Maximum percent**: 200
+   - Click **"Update service"**
+
+3. **Configure Auto Scaling**
+   - In service details → **Auto Scaling** tab
+   - Click **"Create"** or **"Update"**
+   - **Minimum capacity**: 0
+   - **Maximum capacity**: 5
+   - Add scaling policies based on CPU/Memory
+
+### Step 6: Test the Setup
+
+1. **Check Initial State**
+   - ECS Console → Your service should show **Desired: 0, Running: 0**
+
+2. **Make a Request**
+   - Send request to your API Gateway
+   - Check Lambda logs in CloudWatch
+   - Verify ECS service scales to 1
+
+3. **Wait for Scale Down**
+   - Wait 5+ minutes without requests
+   - Check scale-down Lambda logs
+   - Verify service scales back to 0
+
+## Monitoring
+
+- **CloudWatch Logs**: 
+  - `/aws/lambda/your-main-lambda-name`
+  - `/aws/lambda/ecs-scale-down-lambda`
+- **ECS Service Events**: ECS Console → Service → Events tab
+- **EventBridge Rule**: EventBridge Console → Rules → View metrics
+
+This setup provides true zero-scaling with proper monitoring and logging!
